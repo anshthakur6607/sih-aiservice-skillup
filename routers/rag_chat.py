@@ -19,6 +19,7 @@ class ChatRequest(BaseModel):
     course_id: Optional[str] = None
     user_id: str
     voice_mode: bool = False
+    conversation_history: List[dict] = []
 
 class ChatResponse(BaseModel):
     answer: str
@@ -54,13 +55,20 @@ async def multilingual_chat(req: ChatRequest):
             course = course_res.data if course_res else None
             if course:
                 context += f"Course: {course.get('title','')} - {course.get('description','')[:500]}\n"
-            # Fetch up to 3 materials' extracted text
-            mat_res = supa.table("course_materials").select("title, content_text, type, url").eq("course_id", req.course_id).limit(3).execute()
+            # Fetch all available course material records so PDFs, notes,
+            # captions and media metadata can ground the answer.
+            mat_res = supa.table("course_materials").select("title, content_text, type, url, storage_path").eq("course_id", req.course_id).limit(20).execute()
             if mat_res and mat_res.data:
-                for m in mat_res.data[:2]:
-                    txt = (m.get("content_text") or "")[:800]
-                    if txt:
-                        context += f"\nMaterial: {m.get('title','')} ({m.get('type','')})\n{txt}\n"
+                for m in mat_res.data:
+                    txt = (m.get("content_text") or "")[:3000]
+                    context += f"\nMaterial: {m.get('title','')} ({m.get('type','')})\nSource: {m.get('url') or m.get('storage_path') or 'course record'}\n{txt}\n"
+            profile_res = supa.table("profiles").select("full_name, designation, department, years_experience, education").eq("id", req.user_id).maybe_single().execute()
+            if profile_res and profile_res.data:
+                p = profile_res.data
+                context += f"\nLearner profile: designation={p.get('designation')}, department={p.get('department')}, experience={p.get('years_experience')}, education={p.get('education')}"
+            scores_res = supa.table("user_competency_scores").select("current_score, required_score, competency:competencies(name)").eq("user_id", req.user_id).limit(20).execute()
+            if scores_res and scores_res.data:
+                context += "\nLearner skill levels: " + "; ".join(f"{s.get('competency',{}).get('name','skill')}={s.get('current_score')}/{s.get('required_score')}" for s in scores_res.data)
             if context:
                 logger.info(f"Loaded course context for {req.course_id}: {len(context)} chars")
         except Exception as e:
@@ -91,7 +99,8 @@ async def multilingual_chat(req: ChatRequest):
             from google.genai import types
             if os.getenv("GOOGLE_API_KEY"):
                 client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
-                prompt = f"User question: {req.message}\nContext: {context}\nAnswer concisely, preserve technical terms:"
+                history = "\n".join(f"{m.get('role')}: {m.get('content')}" for m in req.conversation_history[-10:])
+                prompt = f"You are a highly personalized MoSPI learning tutor. Use only the course context when answering course questions. Adapt depth to the learner profile and skill gaps, explain step-by-step, give examples, ask a short follow-up when useful.\nConversation:\n{history}\nUser question: {req.message}\nContext:\n{context}\nAnswer in the requested language and preserve technical terms:"
                 resp = client.models.generate_content(model=model_name, contents=prompt, config=types.GenerateContentConfig())
                 answer_en = (resp.text or "")[:800]
                 gemini_ok = True
@@ -144,7 +153,7 @@ async def multilingual_chat(req: ChatRequest):
 async def rag_ingest(payload: dict):
     # Simple ingest endpoint for testing
     course_id = payload.get("course_id", "demo")
-    content = payload.get("content", "")
+    content = payload.get("content") or payload.get("text", "")
     try:
         from langchain_text_splitters import RecursiveCharacterTextSplitter
         splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
@@ -153,8 +162,9 @@ async def rag_ingest(payload: dict):
         from chromadb.config import Settings
         client = chromadb.Client(Settings(persist_directory=os.getenv("CHROMA_PERSIST_DIRECTORY","./chroma_data"), anonymized_telemetry=False))
         col = client.get_or_create_collection("mospi_knowledge_base")
-        ids = [f"{course_id}_{i}" for i in range(len(chunks))]
-        col.add(ids=ids, documents=chunks, metadatas=[{"course_id": course_id} for _ in chunks])
+        material_id = payload.get("material_id", "material")
+        ids = [f"{course_id}_{material_id}_{i}" for i in range(len(chunks))]
+        col.upsert(ids=ids, documents=chunks, metadatas=[{"course_id": course_id, "material_id": material_id, "source": "course_material"} for _ in chunks])
         return {"success": True, "chunks_stored": len(chunks)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

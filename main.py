@@ -28,13 +28,15 @@ Security: All endpoints require AI_SERVICE_API_KEY header for authentication.
 """
 
 import os
+import io
+import json
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning, module="google.*")
 import logging
 from contextlib import asynccontextmanager
 from typing import Optional, List
 
-from fastapi import FastAPI, HTTPException, Header, Depends, UploadFile, File
+from fastapi import FastAPI, HTTPException, Header, Depends, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -121,6 +123,8 @@ class QuizGenerationRequest(BaseModel):
     )
     difficulty: float = Field(default=0.0, ge=-3.0, le=3.0)
     document_text: Optional[str] = None
+    adaptive: bool = False
+    previous_answers: List[dict] = []
 
 
 class QuizQuestion(BaseModel):
@@ -360,6 +364,26 @@ async def generate_quiz(request: QuizGenerationRequest):
     """
     import json, re
     
+    # Retrieve course-specific chunks from Chroma and combine them with the
+    # material text sent by the backend. This grounds generation in the
+    # selected course instead of producing generic questions.
+    rag_context = ""
+    if request.course_id:
+        try:
+            chroma = getattr(app.state, "chroma", None)
+            if chroma:
+                collection = chroma.get_or_create_collection(os.getenv("CHROMA_COLLECTION_NAME", "mospi_knowledge_base"))
+                # Semantic retrieval is the primary path; metadata listing is
+                # a safe fallback for installations without an embedding fn.
+                query = request.document_text or f"training material for {request.course_id}"
+                retrieved = collection.query(query_texts=[query[:4000]], n_results=12, where={"course_id": request.course_id})
+                rag_context = "\n\n".join((retrieved.get("documents") or [[]])[0])
+                if not rag_context:
+                    listed = collection.get(where={"course_id": request.course_id}, limit=12)
+                    rag_context = "\n\n".join(listed.get("documents") or [])
+        except Exception as e:
+            logger.warning(f"Course RAG retrieval failed: {e}")
+
     # Determine content source
     if request.document_text:
         source_text = request.document_text
@@ -367,6 +391,9 @@ async def generate_quiz(request: QuizGenerationRequest):
     else:
         source_text = "General competency assessment questions"
         source_type = "competency"
+    grounded_text = "\n\n--- RETRIEVED COURSE CHUNKS ---\n\n".join(
+        part for part in (rag_context, source_text if source_text != "General competency assessment questions" else "") if part
+    )
     
     prompt = f"""
     Generate {request.question_count} multiple choice quiz questions for a government training program.
@@ -385,8 +412,21 @@ async def generate_quiz(request: QuizGenerationRequest):
     5. bloom_level: one of {request.bloom_levels}
     6. difficulty: IRT b-value around {request.difficulty}
     7. explanation: why the answer is correct
+    - Questions and answers MUST be supported by the source material below.
+    - Every question MUST contain exactly 4 distinct, plausible options and one
+      unambiguous correct_answer index from 0 to 3. Never use placeholders.
+    - Do not invent facts that are not supported by the source.
+    - Adaptive mode: {request.adaptive}. If true, generate only the next question.
+      Use the learner response history below to adjust difficulty and target the
+      next question toward concepts the learner has not mastered.
     
     Return as JSON array.
+
+    SOURCE MATERIAL:
+    {grounded_text[:50000]}
+
+    LEARNER RESPONSE HISTORY (do not reveal or discuss answers):
+    {json.dumps(request.previous_answers[-15:])}
     """
     
     # === CHAIN: Gemini 3.5 Flash → Gemini 3.6 Flash → Sarvam AI → Heuristic fallback ===
@@ -451,22 +491,25 @@ async def generate_quiz(request: QuizGenerationRequest):
     if parsed is None and source_text and source_text != "General competency assessment questions":
         sentences = [s.strip() for s in re.split(r'[.!?]+', source_text) if len(s.strip()) > 20]
         questions = []
-        for i in range(min(request.question_count, max(1, len(sentences)))):
+        if not sentences:
+            raise HTTPException(status_code=503, detail="No readable study material was found for quiz generation")
+        for i in range(min(request.question_count, len(sentences))):
             sent = sentences[i % len(sentences)]
             bloom = request.bloom_levels[i % len(request.bloom_levels)]
+            distractors = [s for j, s in enumerate(sentences) if j != (i % len(sentences))][:3]
+            while len(distractors) < 3:
+                distractors.append(f"A different topic discussed in the material ({len(distractors) + 1})")
+            options = [sent[:180], *[d[:180] for d in distractors]]
+            correct_index = i % 4
+            options[0], options[correct_index] = options[correct_index], options[0]
             questions.append(QuizQuestion(
                 id=f"q_{i+1}",
-                text=f"What is the key concept related to: {sent[:80]}?",
-                options=[
-                    f"Core principle of {sent[:40]}",
-                    f"Unrelated concept A",
-                    f"Unrelated concept B",
-                    f"None of the above"
-                ],
-                correct_answer=0,
+                text=f"According to the study material, which statement is supported?",
+                options=options,
+                correct_answer=correct_index,
                 bloom_level=bloom,
                 difficulty=request.difficulty,
-                explanation=f"Based on document content: {sent[:100]}"
+                explanation=f"The correct answer is stated in the study material: {sent[:180]}"
             ))
         return QuizGenerationResponse(
             questions=questions,
@@ -495,15 +538,32 @@ async def generate_quiz(request: QuizGenerationRequest):
     
     questions = []
     for idx, q in enumerate(raw_questions[:request.question_count]):
-        questions.append(QuizQuestion(
-            id=str(q.get("id", f"q_{idx+1}")),
-            text=str(q["text"]),
-            options=list(q["options"]),
-            correct_answer=int(q["correct_answer"]),
-            bloom_level=str(q.get("bloom_level", request.bloom_levels[0])),
-            difficulty=float(q.get("difficulty", request.difficulty)),
-            explanation=str(q.get("explanation", ""))
-        ))
+        try:
+            options = [str(option).strip() for option in q.get("options", [])]
+            unique_options = []
+            for option in options:
+                if option and option.casefold() not in {x.casefold() for x in unique_options}:
+                    unique_options.append(option)
+            answer_index = int(q.get("correct_answer", -1))
+            bloom = str(q.get("bloom_level", request.bloom_levels[0])).lower()
+            if not str(q.get("text", "")).strip() or len(unique_options) != 4:
+                continue
+            if answer_index not in range(4) or bloom not in {x.lower() for x in request.bloom_levels}:
+                continue
+            questions.append(QuizQuestion(
+                id=str(q.get("id", f"q_{idx+1}")),
+                text=str(q["text"]).strip(),
+                options=unique_options,
+                correct_answer=answer_index,
+                bloom_level=bloom,
+                difficulty=max(-3, min(3, float(q.get("difficulty", request.difficulty)))),
+                explanation=str(q.get("explanation", "")).strip()
+            ))
+        except (TypeError, ValueError, KeyError):
+            continue
+
+    if len(questions) < max(1, request.question_count // 2):
+        raise HTTPException(status_code=502, detail="AI returned too few valid questions. Please retry with the same study material.")
     
     return QuizGenerationResponse(
         questions=questions,
@@ -515,6 +575,35 @@ async def generate_quiz(request: QuizGenerationRequest):
             "generated_at": "2024-01-01T00:00:00Z"
         }
     )
+
+
+@app.post("/api/ai/quiz/generate-from-file", dependencies=[Depends(verify_api_key)])
+async def generate_quiz_from_file(file: UploadFile = File(...), config: str = Form("{}")):
+    """Extract PDF/DOCX/TXT content and run the same grounded quiz pipeline."""
+    try:
+        raw_config = json.loads(config or "{}")
+        raw_config.pop("document_text", None)
+        data = await file.read()
+        filename = (file.filename or "").lower()
+        if filename.endswith(".pdf") or file.content_type == "application/pdf":
+            from pypdf import PdfReader
+            reader = PdfReader(io.BytesIO(data))
+            text = "\n".join(page.extract_text() or "" for page in reader.pages)
+        elif filename.endswith(".docx"):
+            from docx import Document
+            document = Document(io.BytesIO(data))
+            text = "\n".join(paragraph.text for paragraph in document.paragraphs)
+        else:
+            text = data.decode("utf-8", errors="ignore")
+        if len(text.strip()) < 80:
+            raise HTTPException(status_code=422, detail="The uploaded study material has no readable text")
+        request = QuizGenerationRequest(document_text=text[:100000], **raw_config)
+        return await generate_quiz(request)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("File quiz generation failed")
+        raise HTTPException(status_code=422, detail=f"Could not read study material: {e}")
 
 
 @app.post("/api/ai/embed", dependencies=[Depends(verify_api_key)])
