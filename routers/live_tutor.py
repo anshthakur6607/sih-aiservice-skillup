@@ -25,6 +25,9 @@ LANG_FULL_NAME = {
     "mr": "Marathi", "gu": "Gujarati", "kn": "Kannada", "ml": "Malayalam", "pa": "Punjabi", "or": "Odia",
 }
 
+TEXT_MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite"]
+TTS_MODELS = ["gemini-2.5-flash-preview-tts", "gemini-2.5-flash"]
+
 def _client():
     from google import genai
     return genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
@@ -37,18 +40,29 @@ async def synth_tts(text: str, language: str = "en") -> Optional[str]:
         from google.genai import types
         client = _client()
         voice = LANG_VOICE.get(language, "Kore")
-        response = client.models.generate_content(
-            model="gemini-2.5-flash-preview-tts",
-            contents=text,
-            config=types.GenerateContentConfig(
-                response_modalities=["AUDIO"],
-                speech_config=types.SpeechConfig(
-                    voice_config=types.VoiceConfig(
-                        prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice)
+        last_error = None
+        for model_name in TTS_MODELS:
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=text,
+                    config=types.GenerateContentConfig(
+                        response_modalities=["AUDIO"],
+                        speech_config=types.SpeechConfig(
+                            voice_config=types.VoiceConfig(
+                                prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice)
+                            )
+                        ),
                     )
-                ),
-            )
-        )
+                )
+                break
+            except Exception as exc:
+                last_error = exc
+                logger.warning(f"TTS model {model_name} failed: {exc}")
+        else:
+            if last_error:
+                raise last_error
+            return None
         # Extract audio from response.candidates[0].content.parts[*].inline_data.data
         try:
             parts = response.candidates[0].content.parts
@@ -80,10 +94,16 @@ async def transcribe_audio(audio_bytes: bytes, mime: str = "audio/webm", languag
             types.Part.from_text(text=prompt),
             types.Part.from_bytes(data=audio_bytes, mime_type=mime),
         ]
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=[types.Content(role="user", parts=parts)],
-        )
+        for model_name in TEXT_MODELS:
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=[types.Content(role="user", parts=parts)],
+                )
+                return (response.text or "").strip()
+            except Exception as exc:
+                logger.warning(f"STT model {model_name} failed: {exc}")
+        return ""
         return (response.text or "").strip()
     except Exception as e:
         logger.error(f"STT failed: {e}")
@@ -96,11 +116,21 @@ async def chat_reply(prompt: str, language: str = "en") -> str:
     try:
         from google.genai import types
         client = _client()
-        response = client.models.generate_content(
-            model="gemini-3.5-flash",
-            contents=prompt,
-        )
-        return (response.text or "").strip()[:700]
+        last_error = None
+        for model_name in TEXT_MODELS:
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(),
+                )
+                return (response.text or "").strip()[:700]
+            except Exception as exc:
+                last_error = exc
+                logger.warning(f"Tutor model {model_name} failed: {exc}")
+        if last_error:
+            raise last_error
+        return ""
     except Exception as e:
         logger.error(f"Chat failed: {e}")
         return ""
@@ -282,7 +312,9 @@ async def handle_user_question(websocket, user_text, language, course_title, cou
 
     txt = await chat_reply(prompt, language)
     if not txt:
-        txt = f"Nice — let's explore {course_title or 'this topic'} in {lang_name}. What part would you like to start with?"
+        error_msg = "The AI tutor is temporarily unavailable. Please check the AI service configuration or try again in a moment."
+        await websocket.send_text(json.dumps({"type": "error", "message": error_msg, "timestamp": 0}))
+        return
     conversation_history.append({"role": "assistant", "text": txt})
 
     await websocket.send_text(json.dumps({

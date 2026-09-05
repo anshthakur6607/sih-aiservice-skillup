@@ -66,6 +66,30 @@ if not GOOGLE_API_KEY:
 if not AI_SERVICE_API_KEY:
     raise ValueError("AI_SERVICE_API_KEY must be set for security")
 
+
+def is_gemini_rate_limit_error(exc: Exception) -> bool:
+    """Detect Gemini quota/rate-limit responses and route the request to Sarvam fallback."""
+    text = str(exc).lower()
+    status_values = [
+        getattr(exc, "status_code", None),
+        getattr(exc, "status", None),
+        getattr(exc, "code", None),
+    ]
+    if any(value == 429 for value in status_values if value is not None):
+        return True
+    markers = [
+        "429",
+        "rate limit",
+        "rate_limit",
+        "too many requests",
+        "resource exhausted",
+        "quota exceeded",
+        "quota",
+        "temporarily unavailable",
+        "exceeded",
+    ]
+    return any(marker in text for marker in markers)
+
 # ============================================
 # Security: API Key Validation
 # ============================================
@@ -361,9 +385,14 @@ async def generate_quiz(request: QuizGenerationRequest):
     import json, re
     
     # Determine content source
+    placeholder_markers = ["uploaded - will be processed server-side", "will be processed server-side", "[" + "uploaded"]
     if request.document_text:
-        source_text = request.document_text
-        source_type = "document"
+        cleaned = request.document_text.strip()
+        if any(marker in cleaned.lower() for marker in ["uploaded - will be processed server-side", "will be processed server-side", "pdf uploaded", "docx uploaded"]):
+            source_text = ""
+        else:
+            source_text = cleaned
+        source_type = "document" if source_text else "manual"
     else:
         source_text = "General competency assessment questions"
         source_type = "competency"
@@ -413,6 +442,9 @@ async def generate_quiz(request: QuizGenerationRequest):
                 break
             except Exception as e:
                 gemini_error = e
+                if is_gemini_rate_limit_error(e):
+                    logger.warning(f"Gemini {model_name} hit rate limit for quiz; switching to Sarvam AI fallback")
+                    break
                 logger.warning(f"Gemini {model_name} failed for quiz: {e}")
                 continue
     
@@ -450,6 +482,8 @@ async def generate_quiz(request: QuizGenerationRequest):
     # === Heuristic fallback: extract questions from document text ===
     if parsed is None and source_text and source_text != "General competency assessment questions":
         sentences = [s.strip() for s in re.split(r'[.!?]+', source_text) if len(s.strip()) > 20]
+        if not sentences:
+            raise HTTPException(status_code=422, detail="No readable text was found in the uploaded document. Please upload a text file or paste content manually.")
         questions = []
         for i in range(min(request.question_count, max(1, len(sentences)))):
             sent = sentences[i % len(sentences)]

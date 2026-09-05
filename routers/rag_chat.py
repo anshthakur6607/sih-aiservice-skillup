@@ -9,6 +9,29 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 AI_KEY = os.getenv("AI_SERVICE_API_KEY")
+
+
+def is_gemini_rate_limit_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    status_values = [
+        getattr(exc, "status_code", None),
+        getattr(exc, "status", None),
+        getattr(exc, "code", None),
+    ]
+    if any(value == 429 for value in status_values if value is not None):
+        return True
+    return any(marker in text for marker in [
+        "429",
+        "rate limit",
+        "rate_limit",
+        "too many requests",
+        "resource exhausted",
+        "quota exceeded",
+        "quota",
+        "exceeded",
+    ])
+
+
 async def verify_api_key(x_api_key: str = Header(..., alias="X-API-Key")):
     if x_api_key != AI_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
@@ -83,7 +106,7 @@ async def multilingual_chat(req: ChatRequest):
 
     # Gemini generation (google-genai) with model fallback chain
     answer_en = f"Based on course material: {context[:300]}... Answer to '{req.message}'"
-    gemini_models = ["gemini-3.5-flash", "gemini-3.6-flash"]
+    gemini_models = ["gemini-2.5-flash", "gemini-2.5-flash-lite"]
     gemini_ok = False
     for model_name in gemini_models:
         try:
@@ -97,6 +120,9 @@ async def multilingual_chat(req: ChatRequest):
                 gemini_ok = True
                 break
         except Exception as e:
+            if is_gemini_rate_limit_error(e):
+                logger.warning(f"Gemini {model_name} hit rate limit; switching to Sarvam AI fallback")
+                break
             logger.warning(f"Gemini {model_name} fallback: {e}")
             continue
     
